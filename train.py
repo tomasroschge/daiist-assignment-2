@@ -28,8 +28,9 @@ import pandas as pd
 import yaml
 from PIL import Image
 
+import wood_grading
 from api_key import load_api_key
-from wood_grading import ACCEPTABLE_CLASSES, board_score, positive_ids
+from wood_grading import ACCEPTABLE_CLASSES, board_score, positive_ids, share_below
 
 ROOT = Path(__file__).resolve().parent
 
@@ -337,33 +338,11 @@ def run_baselines(data_yaml: Path, finetuned: pd.DataFrame, map50_finetuned: flo
 # ---------------------------------------------------------------------------
 # 5. Cost of each threshold, and the operating point
 # ---------------------------------------------------------------------------
-def share_below(sorted_scores: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Share of boards whose score is strictly below each threshold in t."""
-    return np.searchsorted(sorted_scores, t, side="left") / len(sorted_scores)
-
-
 def expected_cost(pos: np.ndarray, neg: np.ndarray, lo: np.ndarray, hi: np.ndarray,
                   base_rate: float, cost_fn: float = COST_FN, cost_fp: float = COST_FP,
                   cost_review: float = COST_REVIEW) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Expected cost per board, and share of boards sent to review, for thresholds lo <= hi.
-
-    score <  lo        -> PASS   (premium):  a defective board here is a false negative
-    lo <= score < hi   -> REVIEW (grader):   costs the review; I assume the grader decides correctly
-    score >= hi        -> FAIL   (standard): a good board here is a false positive
-
-    The model's error rates come from test (pos = sorted scores of defective boards,
-    neg = of good ones), but they are weighted by the production base rate, not by the
-    test mix. With lo == hi there is no review band: the model decides alone.
-    """
-    pos_pass, pos_below_hi = share_below(pos, lo), share_below(pos, hi)
-    neg_below_lo, neg_below_hi = share_below(neg, lo), share_below(neg, hi)
-    pos_review, neg_review = pos_below_hi - pos_pass, neg_below_hi - neg_below_lo
-    neg_fail = 1 - neg_below_hi
-    cost = (base_rate * (pos_pass * cost_fn + pos_review * cost_review)
-            + (1 - base_rate) * (neg_fail * cost_fp + neg_review * cost_review))
-    review_share = base_rate * pos_review + (1 - base_rate) * neg_review
-    return cost, review_share
+    """wood_grading.expected_cost with this project's cost figures as defaults."""
+    return wood_grading.expected_cost(pos, neg, lo, hi, base_rate, cost_fn, cost_fp, cost_review)
 
 
 def graders_needed(review_share: float) -> int:
