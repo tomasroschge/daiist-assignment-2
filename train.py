@@ -5,10 +5,14 @@ Run with:  uv run python main.py train
 
 Stages:
   1. Prepare the data: download, hold out a validation set, rotate test to landscape.
-  2. Finetune YOLO11 on the defect classes.            (next block)
-  3. Evaluate per class and per image.                  (next block)
-  4. Compare against the two baselines.                 (next block)
-  5. Sweep the threshold and cost it.                   (next block)
+  2. Finetune YOLO11 on the defect classes.
+  3. Evaluate on test, per class and per board.
+  4. Compare against the two baselines on the same test split.
+  5. Sweep the threshold and cost it, with the production base rate.
+  6. Repeat the evaluation and costing on validation (same camera as training).
+
+SKIP_TRAINING=1 reuses weights/wood_yolo11s.pt instead of training (CPU-friendly).
+SMOKE_TEST=1 runs a tiny version only to check that the code works.
 """
 
 import os
@@ -378,7 +382,24 @@ def best_two_thresholds(pos, neg, base_rate, max_review_share=1.0, **costs) -> d
             "cost_per_1000": float(cost[i, j] * 1000), "review_share": float(review[i, j])}
 
 
-def plot_cost_curve(sweep: pd.DataFrame, best_t: float) -> None:
+def production_base_rate(data_yaml: Path) -> tuple[float, float]:
+    """
+    Share of boards on the production line that fail premium:
+    P(any defect) × P(disqualifying | any defect).
+
+    The first factor comes from the original paper. The second comes from the train and
+    validation labels, because those images come from the same line and camera as the
+    paper's figure. The test images come from a different source (see REPORT.md).
+    Returns (base_rate, disqualifying_share).
+    """
+    names = yaml.safe_load(data_yaml.read_text())["names"]
+    labels = pd.concat([image_labels(data_yaml.parent / split / "labels", names) for split in ("train", "valid")])
+    with_defect = labels["group"] != "no defect"
+    disqualifying_share = float(labels.loc[with_defect, "y_true"].mean())
+    return PAPER_DEFECT_SHARE * disqualifying_share, disqualifying_share
+
+
+def plot_cost_curve(sweep: pd.DataFrame, best_t: float, path: Path, title: str) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -390,31 +411,32 @@ def plot_cost_curve(sweep: pd.DataFrame, best_t: float) -> None:
                label=f"chosen threshold {best_t:.3f} (€{best['cost_per_1000']:.0f} per 1,000 boards)")
     ax.set_xlabel("confidence threshold (board fails if score ≥ threshold)")
     ax.set_ylabel("expected cost per 1,000 boards (€)")
-    ax.set_title("Cost against threshold, model deciding alone")
+    ax.set_title(title)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "cost_curve.png", dpi=150)
+    fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
-def cost_analysis(finetuned: pd.DataFrame) -> dict:
-    """Sweep the threshold, pick the operating point, test sensitivity, price the alternatives."""
-    pos = np.sort(finetuned.loc[finetuned["y_true"] == 1, "score"].to_numpy())
-    neg = np.sort(finetuned.loc[finetuned["y_true"] == 0, "score"].to_numpy())
-
-    # Production base rate = P(any defect) × P(disqualifying | any defect), the second from test.
-    defective_any = finetuned["group"] != "no defect"
-    disqualifying_share = float(finetuned.loc[defective_any, "y_true"].mean())
-    base_rate = PAPER_DEFECT_SHARE * disqualifying_share
+def cost_analysis(scores: pd.DataFrame, base_rate: float, disqualifying_share: float,
+                  suffix: str = "", label: str = "test") -> dict:
+    """
+    Sweep the threshold, pick the operating point, test sensitivity, price the alternatives.
+    The model's error rates come from `scores` (one split); the base rate is the production one.
+    Files are written with `suffix` (e.g. "_val") so several splits can be compared.
+    """
+    pos = np.sort(scores.loc[scores["y_true"] == 1, "score"].to_numpy())
+    neg = np.sort(scores.loc[scores["y_true"] == 0, "score"].to_numpy())
 
     # (a) One threshold: the model decides alone.
     cost, _ = expected_cost(pos, neg, THRESHOLDS, THRESHOLDS, base_rate)
     sweep = pd.DataFrame({"threshold": THRESHOLDS, "cost_per_1000": cost * 1000,
                           "recall": 1 - share_below(pos, THRESHOLDS),
                           "false_positive_rate": 1 - share_below(neg, THRESHOLDS)})
-    sweep.to_csv(OUTPUT_DIR / "cost_sweep.csv", index=False)
+    sweep.to_csv(OUTPUT_DIR / f"cost_sweep{suffix}.csv", index=False)
     best_t = float(sweep.loc[sweep["cost_per_1000"].idxmin(), "threshold"])
-    plot_cost_curve(sweep, best_t)
+    plot_cost_curve(sweep, best_t, OUTPUT_DIR / f"cost_curve{suffix}.png",
+                    f"Cost against threshold, model deciding alone ({label})")
 
     # (b) Two thresholds with a review band, with and without the limit of the current graders.
     capacity = GRADERS * (60 / REVIEW_SECONDS) / BOARDS_PER_MINUTE  # max share of boards they can review
@@ -435,7 +457,7 @@ def cost_analysis(finetuned: pd.DataFrame) -> dict:
                          "single_cost_per_1000": float(c.min() * 1000),
                          "band_lo": band["lo"], "band_hi": band["hi"],
                          "band_cost_per_1000": band["cost_per_1000"]})
-    pd.DataFrame(rows).to_csv(OUTPUT_DIR / "sensitivity.csv", index=False)
+    pd.DataFrame(rows).to_csv(OUTPUT_DIR / f"sensitivity{suffix}.csv", index=False)
 
     # (d) The design against the alternatives the brief asks for.
     alternatives = pd.DataFrame([
@@ -450,32 +472,75 @@ def cost_analysis(finetuned: pd.DataFrame) -> dict:
          "review_share": two_capped["review_share"]},
     ])
     alternatives["graders_needed"] = alternatives["review_share"].map(graders_needed)
-    alternatives.to_csv(OUTPUT_DIR / "alternatives.csv", index=False)
+    alternatives.to_csv(OUTPUT_DIR / f"alternatives{suffix}.csv", index=False)
 
     result = {
         "costs": {"FP": COST_FP, "FN": COST_FN, "review": round(COST_REVIEW, 4)},
         "line": {"boards_per_minute": BOARDS_PER_MINUTE, "boards_per_day": BOARDS_PER_DAY,
                  "graders": GRADERS, "review_seconds": REVIEW_SECONDS, "review_capacity_share": capacity},
+        "evaluated_on": label,
         "base_rate": {"paper_defect_share": PAPER_DEFECT_SHARE,
                       "disqualifying_share_of_defective": disqualifying_share, "production": base_rate,
-                      "test": float(finetuned["y_true"].mean())},
+                      f"share_positive_in_{label}": float(scores["y_true"].mean())},
         "single_threshold": {"threshold": best_t, "cost_per_1000": float(sweep["cost_per_1000"].min())},
         "two_thresholds_unconstrained": two_free,
         "two_thresholds_with_2_graders": two_capped,
     }
-    (OUTPUT_DIR / "costs.json").write_text(json.dumps(result, indent=2))
+    (OUTPUT_DIR / f"costs{suffix}.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
     print(alternatives.round(3).to_string(index=False))
     return result
 
 
+# ---------------------------------------------------------------------------
+# 6. Same evaluation on validation: same camera and line as training
+# ---------------------------------------------------------------------------
+def evaluate_validation(weights: Path, data_yaml: Path) -> pd.DataFrame:
+    """
+    The test split comes from a different source than train (other camera and lighting),
+    so I also evaluate on the held-out validation images, which come from the training
+    line. Validation picked the best epoch, so these numbers are slightly optimistic.
+    """
+    from ultralytics import YOLO
+
+    model = YOLO(str(weights))
+    names = model.names
+    metrics = model.val(data=str(data_yaml), split="val", imgsz=IMGSZ, batch=BATCH,
+                        project=str(RUNS_DIR), name="val_eval", exist_ok=True, plots=False, verbose=False)
+    per_class = pd.DataFrame(metrics.summary())
+    positive_names = {names[i] for i in positive_ids(names)}
+    per_class["label"] = per_class["Class"].map(
+        lambda c: "positive" if c in positive_names else "acceptable" if c in ACCEPTABLE_CLASSES else "excluded")
+    per_class.to_csv(OUTPUT_DIR / "per_class_val.csv", index=False)
+
+    val_dir = data_yaml.parent / "valid"
+    scores = image_labels(val_dir / "labels", names).merge(
+        score_images(model, val_dir / "images", positive_ids(names)), on="image")
+    scores.to_csv(OUTPUT_DIR / "val_scores_finetuned.csv", index=False)
+
+    summary = {"mAP50": float(metrics.box.map50), "mAP50-95": float(metrics.box.map),
+               "ROC AUC (boards)": roc_auc(scores["y_true"], scores["score"]),
+               **image_metrics(scores, threshold=CM_CONF)}
+    (OUTPUT_DIR / "metrics_val.json").write_text(json.dumps(summary, indent=2))
+    print(f"Validation mAP50={summary['mAP50']:.3f}  board AUC={summary['ROC AUC (boards)']:.3f}")
+    return scores
+
+
 def main() -> None:
     data_yaml = prepare_data()
-    weights = train_model(data_yaml)
+    # SKIP_TRAINING=1 reuses the committed weights, e.g. to rerun the evaluation without a GPU.
+    if os.environ.get("SKIP_TRAINING") == "1" and WEIGHTS_PATH.exists():
+        weights = WEIGHTS_PATH
+    else:
+        weights = train_model(data_yaml)
     finetuned = evaluate(weights, data_yaml)
     map50 = json.loads((OUTPUT_DIR / "metrics.json").read_text())["mAP50"]
     run_baselines(data_yaml, finetuned, map50)
-    cost_analysis(finetuned)
+
+    base_rate, disqualifying_share = production_base_rate(data_yaml)
+    cost_analysis(finetuned, base_rate, disqualifying_share, suffix="", label="test")
+    val_scores = evaluate_validation(weights, data_yaml)
+    cost_analysis(val_scores, base_rate, disqualifying_share, suffix="_val", label="validation")
 
 
 if __name__ == "__main__":
